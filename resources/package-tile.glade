@@ -272,6 +272,30 @@
       </packing>
     </child>
     <child type="overlay">
+      <object class="GtkToggleButton" id="bulk_select_toggle">
+        <property name="visible">True</property>
+        <property name="can-focus">False</property>
+        <property name="receives-default">False</property>
+        <property name="halign">end</property>
+        <property name="valign">start</property>
+        <property name="margin-top">6</property>
+        <property name="margin-end">6</property>
+        <property name="no-show-all">True</property>
+        <property name="relief">none</property>
+        <child>
+          <object class="GtkImage" id="bulk_select_image">
+            <property name="visible">True</property>
+            <property name="can-focus">False</property>
+            <property name="icon-name">list-add-symbolic</property>
+            <property name="icon_size">1</property>
+          </object>
+        </child>
+      </object>
+      <packing>
+        <property name="index">1</property>
+      </packing>
+    </child>
+    <child type="overlay">
       <object class="GtkBox" id="installed_box">
         <property name="name">installed_box</property>
         <property name="visible">True</property>
