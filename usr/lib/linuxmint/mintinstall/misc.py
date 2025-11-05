@@ -5,25 +5,30 @@ import time
 
 from gi.repository import Gio
 
-DEBUG_MODE = os.getenv("DEBUG", False)
+def _debug_enabled() -> bool:
+    value = os.getenv("DEBUG", "")
+    return value.lower() in ("1", "true", "yes", "on")
+
+
+DEBUG_MODE = _debug_enabled()
 
 # Used as a decorator to time functions
 def print_timing(func):
     if not DEBUG_MODE:
         return func
     else:
-        def wrapper(*arg):
+        def wrapper(*args, **kwargs):
             t1 = time.time()
-            res = func(*arg)
+            res = func(*args, **kwargs)
             t2 = time.time()
             print('%s took %0.3f ms' % (func.__qualname__, (t2 - t1) * 1000.0))
             return res
         return wrapper
 
-def debug(str):
+def debug(message):
     if not DEBUG_MODE:
         return
-    print("Mintinstall (DEBUG): %s" % str)
+    print("Mintinstall (DEBUG): %s" % message)
 
 def networking_available():
     nm = Gio.NetworkMonitor.get_default()
