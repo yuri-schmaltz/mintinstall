@@ -19,6 +19,7 @@ import math
 from pathlib import Path
 import traceback
 from operator import attrgetter
+from collections import deque
 
 import gi
 gi.require_version('Gtk', '3.0')
@@ -397,7 +398,7 @@ class BannerTile(Gtk.FlowBoxChild):
         self.box = hbox
 
 class PackageTile(Gtk.FlowBoxChild):
-    def __init__(self, pkginfo, installer, show_package_type=False, review_info=None):
+    def __init__(self, pkginfo, installer, selection_handler, show_package_type=False, review_info=None):
         super(PackageTile, self).__init__()
 
         self.button = Gtk.Button();
@@ -407,8 +408,10 @@ class PackageTile(Gtk.FlowBoxChild):
 
         self.pkginfo = pkginfo
         self.installer = installer
+        self.selection_handler = selection_handler
         self.review_info = review_info
         self.show_package_type = show_package_type
+        self._bulk_toggle_blocked = False
 
         self.pkg_category = ''
         if len(pkginfo.categories) > 0:
@@ -431,6 +434,14 @@ class PackageTile(Gtk.FlowBoxChild):
         self.package_type_name = self.builder.get_object("package_type_name")
         self.installed_mark = self.builder.get_object("installed_mark")
         self.verified_mark = self.builder.get_object("verified_mark")
+        self.bulk_toggle = self.builder.get_object("bulk_select_toggle")
+        self.bulk_toggle_image = self.builder.get_object("bulk_select_image")
+        self.bulk_toggle_handler_id = self.bulk_toggle.connect("toggled", self.on_bulk_toggle_toggled)
+        if self.selection_handler is None:
+            self.bulk_toggle.hide()
+        else:
+            self.bulk_toggle.show()
+            self.bulk_toggle.set_tooltip_text(_("Mark or unmark this application for batch actions"))
         self.icon = None
 
         self.repopulate_tile()
@@ -493,6 +504,61 @@ class PackageTile(Gtk.FlowBoxChild):
             self.installed_mark.set_from_icon_name("mintinstall-installed", Gtk.IconSize.MENU)
         else:
             self.installed_mark.clear()
+
+        if self.selection_handler is not None:
+            self.update_bulk_toggle()
+
+    def update_bulk_toggle(self):
+        if self.selection_handler is None:
+            return
+
+        action = self.selection_handler.get_bulk_action_for_pkg(self.pkginfo)
+        is_installed = self.installer.pkginfo_is_installed(self.pkginfo)
+        selected = action is not None
+
+        if not selected:
+            action = "remove" if is_installed else "install"
+
+        style = self.bulk_toggle.get_style_context()
+        style.remove_class("suggested-action")
+        style.remove_class("destructive-action")
+
+        if selected:
+            if action == "install":
+                icon_name = "emblem-ok-symbolic"
+                tooltip = _("Marked for batch installation")
+                style.add_class("suggested-action")
+            else:
+                icon_name = "emblem-ok-symbolic"
+                tooltip = _("Marked for batch removal")
+                style.add_class("destructive-action")
+        else:
+            if action == "install":
+                icon_name = "list-add-symbolic"
+                tooltip = _("Mark for batch installation")
+            else:
+                icon_name = "edit-delete-symbolic"
+                tooltip = _("Mark for batch removal")
+
+        self._bulk_toggle_blocked = True
+        self.bulk_toggle.set_active(selected)
+        self._bulk_toggle_blocked = False
+        self.bulk_toggle_image.set_from_icon_name(icon_name, Gtk.IconSize.BUTTON)
+        self.bulk_toggle.set_tooltip_text(tooltip)
+        self.bulk_toggle.set_sensitive(not self.selection_handler.bulk_processing)
+        self.bulk_toggle.show()
+
+    def on_bulk_toggle_toggled(self, button):
+        if self.selection_handler is None:
+            return
+        if self.selection_handler.bulk_processing:
+            self.update_bulk_toggle()
+            return
+        if self._bulk_toggle_blocked:
+            return
+
+        self.selection_handler.toggle_bulk_selection(self.pkginfo, button.get_active())
+        self.update_bulk_toggle()
 
     def fill_rating_widget(self, review_info):
         rating = str(review_info.avg_rating)
@@ -656,6 +722,15 @@ class Application(Gtk.Application):
 
         self.picks_tiles = []
         self.category_tiles = []
+
+        self.bulk_install_selection = set()
+        self.bulk_remove_selection = set()
+        self.bulk_queue = deque()
+        self.bulk_processing = False
+        self.bulk_current_action = None
+        self.bulk_current_pkginfo = None
+        self.bulk_current_task = None
+        self.bulk_current_cancellable = None
 
         self.one_package_idle_timer = 0
         self.installer_pulse_timer = 0
@@ -846,6 +921,12 @@ class Application(Gtk.Application):
         self.active_tasks_button = self.builder.get_object("active_tasks_button")
         self.active_tasks_spinner = self.builder.get_object("active_tasks_spinner")
         self.no_packages_found_label = self.builder.get_object("no_packages_found_label")
+        self.bulk_toggle_button = self.builder.get_object("bulk_toggle_button")
+        self.bulk_toggle_handler_id = 0
+        if self.bulk_toggle_button is not None:
+            self.bulk_toggle_handler_id = self.bulk_toggle_button.connect("toggled", self.on_detail_bulk_toggle_toggled)
+            self.bulk_toggle_button.hide()
+            self.bulk_toggle_button.set_sensitive(False)
 
         self.no_packages_found_refresh_button = self.builder.get_object("no_packages_found_refresh_button")
         self.no_packages_found_refresh_button.connect("clicked", self.on_refresh_cache_clicked)
@@ -890,6 +971,12 @@ class Application(Gtk.Application):
         self.prefs_menuitem.show()
         self.prefs_menuitem.set_sensitive(True)
         submenu.append(self.prefs_menuitem)
+
+        self.bulk_apply_button = self.builder.get_object("bulk_apply_button")
+        if self.bulk_apply_button is not None:
+            self.bulk_apply_button.connect("clicked", self.on_bulk_apply_button_clicked)
+            self.bulk_apply_button.hide()
+            self.update_bulk_apply_button()
 
         separator = Gtk.SeparatorMenuItem()
         separator.show()
@@ -1383,7 +1470,7 @@ class Application(Gtk.Application):
                 review_info = self.review_cache[pkginfo.name]
             else:
                 review_info = None
-            tile = PackageTile(pkginfo, self.installer, show_package_type=True, review_info=review_info)
+            tile = PackageTile(pkginfo, self.installer, self, show_package_type=True, review_info=review_info)
             size_group.add_widget(tile)
             self.flowbox_top_rated.insert(tile, -1)
             self.picks_tiles.append(tile)
@@ -1441,7 +1528,7 @@ class Application(Gtk.Application):
                 review_info = self.review_cache[pkginfo.name]
             else:
                 review_info = None
-            tile = PackageTile(pkginfo, self.installer, show_package_type=True, review_info=review_info)
+            tile = PackageTile(pkginfo, self.installer, self, show_package_type=True, review_info=review_info)
             size_group.add_widget(tile)
             self.flowbox_featured.insert(tile, -1)
             self.picks_tiles.append(tile)
@@ -1547,8 +1634,9 @@ class Application(Gtk.Application):
     def update_state(self, pkginfo):
         self.update_activity_widgets()
 
+        is_installed = self.installer.pkginfo_is_installed(pkginfo)
         installed_packages = self.settings.get_strv(prefs.INSTALLED_APPS)
-        if self.installer.pkginfo_is_installed(pkginfo):
+        if is_installed:
             if pkginfo.pkg_hash not in installed_packages:
                 installed_packages.append(pkginfo.pkg_hash)
                 if pkginfo not in self.installed_category.pkginfos:
@@ -1561,6 +1649,11 @@ class Application(Gtk.Application):
                         self.installed_category.pkginfos.remove(iter_package)
 
         self.settings.set_strv(prefs.INSTALLED_APPS, installed_packages)
+
+        if is_installed and pkginfo.pkg_hash in self.bulk_install_selection:
+            self.bulk_install_selection.remove(pkginfo.pkg_hash)
+        if (not is_installed) and pkginfo.pkg_hash in self.bulk_remove_selection:
+            self.bulk_remove_selection.remove(pkginfo.pkg_hash)
 
         if self.current_pkginfo is not None and self.current_pkginfo.pkg_hash == pkginfo.pkg_hash:
             # flatpaks added by flatpakref files auto-remove their remotes when uninstalled
@@ -1597,6 +1690,310 @@ class Application(Gtk.Application):
                 tile.refresh_state()
             except Exception as e:
                 print(e)
+
+        if self.current_pkginfo is not None and self.current_pkginfo.pkg_hash == pkginfo.pkg_hash:
+            self.update_detail_bulk_toggle(pkginfo)
+
+        self.update_bulk_apply_button()
+
+    def _set_toggle_active(self, widget, handler_id, active):
+        if widget is None or handler_id == 0:
+            return
+        widget.handler_block(handler_id)
+        widget.set_active(active)
+        widget.handler_unblock(handler_id)
+
+    def get_bulk_action_for_pkg(self, pkginfo):
+        if pkginfo.pkg_hash in self.bulk_install_selection:
+            return "install"
+        if pkginfo.pkg_hash in self.bulk_remove_selection:
+            return "remove"
+        return None
+
+    def toggle_bulk_selection(self, pkginfo, active):
+        if pkginfo is None:
+            return
+        if self.bulk_processing:
+            self.refresh_tiles_for_pkg(pkginfo)
+            if self.current_pkginfo is not None and self.current_pkginfo.pkg_hash == pkginfo.pkg_hash:
+                self.update_detail_bulk_toggle(pkginfo)
+            return
+
+        is_installed = self.installer.pkginfo_is_installed(pkginfo)
+        if active:
+            if is_installed:
+                self.bulk_remove_selection.add(pkginfo.pkg_hash)
+                self.bulk_install_selection.discard(pkginfo.pkg_hash)
+            else:
+                self.bulk_install_selection.add(pkginfo.pkg_hash)
+                self.bulk_remove_selection.discard(pkginfo.pkg_hash)
+        else:
+            self.bulk_install_selection.discard(pkginfo.pkg_hash)
+            self.bulk_remove_selection.discard(pkginfo.pkg_hash)
+
+        self.refresh_tiles_for_pkg(pkginfo)
+        if self.current_pkginfo is not None and self.current_pkginfo.pkg_hash == pkginfo.pkg_hash:
+            self.update_detail_bulk_toggle(pkginfo)
+        self.update_bulk_apply_button()
+
+    def refresh_tiles_for_pkg(self, pkginfo):
+        for tile in (self.picks_tiles + self.category_tiles):
+            if tile.pkginfo == pkginfo:
+                tile.refresh_state()
+        for tile in self.flowbox_applications.get_children():
+            try:
+                if getattr(tile, "pkginfo", None) == pkginfo:
+                    tile.refresh_state()
+            except Exception as e:
+                print(e)
+
+    def update_bulk_apply_button(self):
+        if not hasattr(self, "bulk_apply_button") or self.bulk_apply_button is None:
+            return
+
+        total_marked = len(self.bulk_install_selection) + len(self.bulk_remove_selection)
+
+        if self.bulk_processing:
+            in_progress = 1 if self.bulk_current_pkginfo is not None else 0
+            pending = len(self.bulk_queue)
+            remaining = max(total_marked, pending + in_progress)
+            if remaining > 0:
+                label = _("Applying selections (%d)") % remaining
+            else:
+                label = _("Applying selections")
+            self.bulk_apply_button.set_label(label)
+            self.bulk_apply_button.set_sensitive(False)
+            self.bulk_apply_button.set_tooltip_text(_("Batch operations are currently being processed."))
+            self.bulk_apply_button.show()
+        else:
+            if total_marked > 0:
+                label = _("Apply selections (%d)") % total_marked
+                self.bulk_apply_button.set_label(label)
+                self.bulk_apply_button.set_sensitive(True)
+                self.bulk_apply_button.set_tooltip_text(_("Install or remove all marked applications."))
+                self.bulk_apply_button.show()
+            else:
+                self.bulk_apply_button.hide()
+
+    def update_detail_bulk_toggle(self, pkginfo):
+        if self.bulk_toggle_button is None:
+            return
+
+        action = self.get_bulk_action_for_pkg(pkginfo)
+        is_installed = self.installer.pkginfo_is_installed(pkginfo)
+        selected = action is not None
+
+        if not selected:
+            action = "remove" if is_installed else "install"
+
+        if action == "install":
+            default_label = _("Mark for installation")
+            active_label = _("Marked for installation")
+            default_tooltip = _("Add this application to the batch installation list.")
+            active_tooltip = _("This application is queued for batch installation.")
+        else:
+            default_label = _("Mark for removal")
+            active_label = _("Marked for removal")
+            default_tooltip = _("Add this application to the batch removal list.")
+            active_tooltip = _("This application is queued for batch removal.")
+
+        style = self.bulk_toggle_button.get_style_context()
+        style.remove_class("suggested-action")
+        style.remove_class("destructive-action")
+        if selected:
+            if action == "install":
+                style.add_class("suggested-action")
+            else:
+                style.add_class("destructive-action")
+
+        self._set_toggle_active(self.bulk_toggle_button, self.bulk_toggle_handler_id, selected)
+        self.bulk_toggle_button.set_label(active_label if selected else default_label)
+        self.bulk_toggle_button.set_tooltip_text(active_tooltip if selected else default_tooltip)
+        self.bulk_toggle_button.set_sensitive(not self.bulk_processing)
+        self.bulk_toggle_button.show()
+
+    def refresh_detail_bulk_toggle(self):
+        if self.bulk_toggle_button is None:
+            return
+        if self.current_pkginfo is None:
+            self.bulk_toggle_button.hide()
+            return
+        self.update_detail_bulk_toggle(self.current_pkginfo)
+
+    def on_detail_bulk_toggle_toggled(self, button):
+        if self.current_pkginfo is None:
+            return
+        if self.bulk_processing:
+            self.update_detail_bulk_toggle(self.current_pkginfo)
+            return
+        self.toggle_bulk_selection(self.current_pkginfo, button.get_active())
+
+    def on_bulk_apply_button_clicked(self, button):
+        if self.bulk_processing:
+            return
+        if self.installer.is_busy():
+            dialogs.show_error(_("The installer is currently busy. Please wait for ongoing operations to finish."))
+            return
+
+        operations = []
+        invalid_install_hashes = set()
+        invalid_remove_hashes = set()
+        affected_pkginfos = set()
+
+        for pkg_hash in list(self.bulk_install_selection):
+            pkginfo = self.installer.cache.get(pkg_hash)
+            if pkginfo is None or self.installer.pkginfo_is_installed(pkginfo):
+                invalid_install_hashes.add(pkg_hash)
+                if pkginfo is not None:
+                    affected_pkginfos.add(pkginfo)
+                continue
+            operations.append(("install", pkginfo))
+
+        for pkg_hash in list(self.bulk_remove_selection):
+            pkginfo = self.installer.cache.get(pkg_hash)
+            if pkginfo is None or not self.installer.pkginfo_is_installed(pkginfo):
+                invalid_remove_hashes.add(pkg_hash)
+                if pkginfo is not None:
+                    affected_pkginfos.add(pkginfo)
+                continue
+            operations.append(("remove", pkginfo))
+
+        for pkg_hash in invalid_install_hashes:
+            self.bulk_install_selection.discard(pkg_hash)
+        for pkg_hash in invalid_remove_hashes:
+            self.bulk_remove_selection.discard(pkg_hash)
+
+        for pkginfo in affected_pkginfos:
+            self.refresh_tiles_for_pkg(pkginfo)
+            if self.current_pkginfo is not None and self.current_pkginfo.pkg_hash == pkginfo.pkg_hash:
+                self.update_detail_bulk_toggle(pkginfo)
+
+        if not operations:
+            self.update_bulk_apply_button()
+            self.refresh_detail_bulk_toggle()
+            return
+
+        operations.sort(key=lambda item: item[1].get_display_name().lower())
+        self.bulk_queue = deque(operations)
+        self.bulk_processing = True
+        self.bulk_current_action = None
+        self.bulk_current_pkginfo = None
+        self.bulk_current_task = None
+        self.bulk_current_cancellable = None
+        self.update_bulk_apply_button()
+        self.process_next_bulk_operation()
+
+    def process_next_bulk_operation(self):
+        while self.bulk_queue:
+            action, pkginfo = self.bulk_queue.popleft()
+            if action == "install" and self.installer.pkginfo_is_installed(pkginfo):
+                self.bulk_install_selection.discard(pkginfo.pkg_hash)
+                self.refresh_tiles_for_pkg(pkginfo)
+                if self.current_pkginfo is not None and self.current_pkginfo.pkg_hash == pkginfo.pkg_hash:
+                    self.update_detail_bulk_toggle(pkginfo)
+                continue
+            if action == "remove" and not self.installer.pkginfo_is_installed(pkginfo):
+                self.bulk_remove_selection.discard(pkginfo.pkg_hash)
+                self.refresh_tiles_for_pkg(pkginfo)
+                if self.current_pkginfo is not None and self.current_pkginfo.pkg_hash == pkginfo.pkg_hash:
+                    self.update_detail_bulk_toggle(pkginfo)
+                continue
+
+            self.bulk_current_action = action
+            self.bulk_current_pkginfo = pkginfo
+            self.bulk_current_task = None
+            self.bulk_current_cancellable = self.installer.select_pkginfo(
+                pkginfo,
+                self.on_bulk_task_info_ready,
+                self.on_bulk_task_info_error,
+                self.on_bulk_task_finished,
+                self.on_bulk_task_progress,
+                use_mainloop=True)
+            self.update_bulk_apply_button()
+            return
+
+        self.bulk_processing = False
+        self.bulk_current_action = None
+        self.bulk_current_pkginfo = None
+        self.bulk_current_task = None
+        self.bulk_current_cancellable = None
+        self.update_bulk_apply_button()
+        self.refresh_detail_bulk_toggle()
+
+    def on_bulk_task_info_ready(self, task):
+        if not self.bulk_processing or self.bulk_current_pkginfo is None:
+            return
+        if task.pkginfo != self.bulk_current_pkginfo:
+            return
+
+        self.bulk_current_task = task
+
+        if task.info_ready_status != task.STATUS_OK:
+            self.on_bulk_task_info_error(task)
+            return
+
+        if task.type != self.bulk_current_action:
+            self.finish_current_bulk_task(remove_selection=False)
+            return
+
+        if not self.installer.confirm_task(task):
+            self.finish_current_bulk_task(remove_selection=False)
+            return
+
+        self.installer.execute_task(task)
+
+    def on_bulk_task_info_error(self, task):
+        if not self.bulk_processing or self.bulk_current_pkginfo is None:
+            return
+        if task.pkginfo != self.bulk_current_pkginfo:
+            return
+
+        error_message = getattr(task, "error_message", None)
+        if error_message:
+            dialogs.show_error(error_message)
+
+        self.finish_current_bulk_task(remove_selection=False)
+
+    def on_bulk_task_progress(self, pkginfo, progress, estimating, status_text=None):
+        return
+
+    def on_bulk_task_finished(self, task):
+        if not self.bulk_processing or self.bulk_current_pkginfo is None or task.pkginfo != self.bulk_current_pkginfo:
+            self.update_state(task.pkginfo)
+            return
+
+        self.update_state(task.pkginfo)
+
+        succeeded = False
+        if self.bulk_current_action == "install":
+            succeeded = self.installer.pkginfo_is_installed(task.pkginfo)
+        elif self.bulk_current_action == "remove":
+            succeeded = not self.installer.pkginfo_is_installed(task.pkginfo)
+
+        self.finish_current_bulk_task(remove_selection=succeeded)
+
+    def finish_current_bulk_task(self, remove_selection):
+        pkginfo = self.bulk_current_pkginfo
+        action = self.bulk_current_action
+
+        self.bulk_current_action = None
+        self.bulk_current_pkginfo = None
+        self.bulk_current_task = None
+        self.bulk_current_cancellable = None
+
+        if pkginfo is not None and remove_selection:
+            if action == "install":
+                self.bulk_install_selection.discard(pkginfo.pkg_hash)
+            elif action == "remove":
+                self.bulk_remove_selection.discard(pkginfo.pkg_hash)
+
+        if pkginfo is not None:
+            self.refresh_tiles_for_pkg(pkginfo)
+            if self.current_pkginfo is not None and self.current_pkginfo.pkg_hash == pkginfo.pkg_hash:
+                self.update_detail_bulk_toggle(pkginfo)
+
+        self.update_bulk_apply_button()
+        self.process_next_bulk_operation()
 
     def modernize_installed_list(self, packages):
         """
@@ -2283,6 +2680,7 @@ class Application(Gtk.Application):
 
     def show_active_tasks(self):
         self.current_pkginfo = None
+        self.refresh_detail_bulk_toggle()
 
         self.active_tasks_category.pkginfos = self.installer.get_active_pkginfos()
 
@@ -2312,6 +2710,7 @@ class Application(Gtk.Application):
             self.search_tool_item.set_sensitive(True)
 
         self.current_pkginfo = None
+        self.refresh_detail_bulk_toggle()
         self.page_stack.set_visible_child_name(self.previous_page)
         if self.previous_page == self.PAGE_LANDING:
             self.back_button.set_sensitive(False)
@@ -2349,6 +2748,7 @@ class Application(Gtk.Application):
 
     def show_category(self, category):
         self.current_pkginfo = None
+        self.refresh_detail_bulk_toggle()
 
         cat_box = self.builder.get_object("box_cat_label")
         label = self.builder.get_object("label_cat_name")
@@ -2421,6 +2821,7 @@ class Application(Gtk.Application):
         XApp.set_window_progress(self.main_window, 0)
         self.stop_progress_pulse()
         self.current_pkginfo = None
+        self.refresh_detail_bulk_toggle()
 
         for child in self.flowbox_applications.get_children():
             self.flowbox_applications.remove(child)
@@ -2670,7 +3071,7 @@ class Application(Gtk.Application):
         else:
             review_info = None
 
-        tile = PackageTile(pkginfo, self.installer, show_package_type=True, review_info=review_info)
+        tile = PackageTile(pkginfo, self.installer, self, show_package_type=True, review_info=review_info)
         self.flowbox_applications.insert(tile, -1)
         self.category_tiles.append(tile)
 
@@ -2709,6 +3110,7 @@ class Application(Gtk.Application):
         self.reset_scroll_view(self.builder.get_object("scrolled_details"))
 
         self.current_pkginfo = pkginfo
+        self.update_detail_bulk_toggle(pkginfo)
         is_flatpak = pkginfo.pkg_hash.startswith("fp:")
 
         # Set to busy while the installer figures out what to do
